@@ -1,0 +1,39 @@
+[package]
+name = "esp32-environmental"
+version = "0.1.0"
+authors = ["prezus <prezus@gmail.com>"]
+edition = "2021"
+resolver = "2"
+rust-version = "1.77"
+
+[[bin]]
+name = "esp32-environmental"
+harness = false # do not use the built-in cargo test harness -> resolve rust-analyzer errors
+
+[profile.release]
+opt-level = "s"
+
+[profile.dev]
+debug = true    # symbols are nice and they don't increase the size on flash
+opt-level = "z"
+
+[features]
+default = []
+
+[dependencies]
+log = "0.4"
+anyhow = "1"
+# `experimental` enables the safe SD-card + FAT filesystem wrappers (esp_idf_svc::fs::fatfs / hal::sd).
+esp-idf-svc = { version = "0.51", features = ["experimental"] }
+# Device drivers (embedded-hal 1.0).
+sht4x = "0.2"                                         # SHT45 temperature/humidity
+nxp-pcf8523 = { version = "2", features = ["sync"] } # PCF8523 RTC (blocking API)
+embedded-hal = "1"                                   # I2c/Delay traits used in driver wrappers
+embedded-hal-bus = "0.3"                             # RefCellDevice: share one I2C bus between both drivers
+# Epoch -> civil conversion when setting the RTC from SNTP.
+time = "0.3"
+# Compile-time WiFi credentials read from cfg.toml.
+toml-cfg = "0.2"
+
+[build-dependencies]
+embuild = "0.33"

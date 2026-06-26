@@ -1,0 +1,6 @@
+/target
+/.embuild
+# Real secrets live here; keep them out of git. Use cfg.toml.example as the template.
+/cfg.toml
+*.log
+.DS_Store

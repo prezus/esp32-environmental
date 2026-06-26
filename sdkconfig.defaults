@@ -1,0 +1,18 @@
+# Route the runtime console (println!/log + stdin) over the ESP32-S3's built-in
+# USB-Serial-JTAG, which is what the Feather's USB-C exposes. This is what makes
+# `just monitor` show logs and `just wipe-sd` (stdin) reach the firmware.
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+
+# The main task runs init + the sampling loop; give it headroom for WiFi + FAT.
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=24576
+
+# Long filenames on the FAT/SD card (so "2026-06-26.csv" etc. work).
+CONFIG_FATFS_LFN_HEAP=y
+CONFIG_FATFS_MAX_LFN=255
+
+# Slightly larger HTTP request header buffer for the dashboard/API.
+CONFIG_HTTPD_MAX_REQ_HDR_LEN=1024
+
+# More LWIP sockets so the HTTP server can hold several concurrent connections
+# (esp-idf requires httpd max_open_sockets <= LWIP_MAX_SOCKETS - 3).
+CONFIG_LWIP_MAX_SOCKETS=16

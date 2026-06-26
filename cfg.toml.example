@@ -1,0 +1,10 @@
+# Copy this file to `cfg.toml` and fill in your real values.
+# `cfg.toml` is gitignored so your WiFi password never gets committed.
+# The table name MUST match the crate name ("esp32-environmental").
+[esp32-environmental]
+wifi_ssid = "YOUR_WIFI_SSID"
+wifi_psk = "YOUR_WIFI_PASSWORD"
+# How often to sample temperature/humidity, in seconds.
+sample_interval_secs = 30
+# Hostname advertised over mDNS -> reachable at http://<hostname>.local
+hostname = "esp32-env"
