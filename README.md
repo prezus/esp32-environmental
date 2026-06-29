@@ -100,28 +100,34 @@ CSV opens directly in Excel / Sheets / pandas. The dashboard also exposes:
 | `GET /api/files` | available log dates as JSON |
 | `GET /api/data?date=YYYY-MM-DD` | a day's points as JSON (for the charts) |
 | `GET /download?date=YYYY-MM-DD` | raw CSV download (export) |
+| `GET /api/config` | current temperature offset as JSON |
+| `POST /api/config?temp_offset_f=<delta>` | set the temperature offset (°F) |
 
 The dashboard's charting library (`assets/chart.umd.min.js`) is embedded into the firmware
 and served locally, so the dashboard works with no internet access.
 
 ## Wipe the SD card
 
-Easiest first:
+Power off, eject the card, and reformat it on a computer as **FAT32 / MS-DOS (FAT)**
+with an **MBR** scheme (not exFAT/APFS — the firmware's FAT driver won't mount those).
+On reinsertion the firmware recreates `/sdcard/logs/` and starts a fresh CSV.
 
-1. **Dashboard** — click the **Wipe logs** button (asks for confirmation).
-2. **HTTP** — `curl -X POST http://<device-ip>/wipe` from any machine on the network.
-3. **Serial** (no network needed) — type `WIPE` + Enter in `just monitor`.
-4. **Physical** — power off, eject the card, and reformat on a computer as **FAT32 /
-   MS-DOS (FAT)** with an **MBR** scheme (not exFAT/APFS). Use this only if the
-   filesystem itself is corrupted.
+> If the card is >32 GB, Disk Utility may only offer exFAT; use a ≤32 GB card or
+> `diskutil eraseDisk FAT32 ESP32 MBRFormat /dev/diskN` (verify `diskN` first).
 
-Options 1–3 delete every `.csv` under `/sdcard/logs/`; the card stays in the device.
+## Temperature calibration
+
+The SHT45 sits near the warm ESP32, so it can read a few °F high (self-heating). The
+dashboard has a **Temp calibration offset (°F)** field — enter a delta (e.g. `-4.5`),
+click **Save**, and it's applied to all new readings and persisted in NVS (survives
+reboots and card reformats). It does not rewrite already-logged rows. Also settable via
+`POST /api/config?temp_offset_f=<delta>`. Prefer physically moving the sensor away from
+the board first; use the offset to fine-tune.
 
 ## How it works
 
-- **Sampling loop** (main task): read SHT45 → timestamp from the PCF8523 RTC → append a CSV row → update the shared "latest reading".
-- **HTTP server** (background tasks): serves the dashboard, JSON API, and CSV downloads.
-- **Serial listener** (background thread): handles the `WIPE` command.
+- **Sampling loop** (main task): read SHT45 → apply the calibration offset → timestamp from the PCF8523 RTC → append a CSV row → update the shared "latest reading".
+- **HTTP server** (background tasks): serves the dashboard, JSON API, CSV downloads, and the calibration config endpoint.
 - **Time**: on boot with WiFi, SNTP syncs the system clock and writes it into the RTC. The RTC (battery-backed) then provides timestamps even offline.
 
 All SD access is serialized by a mutex so the writer and HTTP readers don't collide.

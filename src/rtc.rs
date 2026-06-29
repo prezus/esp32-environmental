@@ -50,7 +50,11 @@ pub fn now<I: I2c, V: Variant>(rtc: &mut Pcf8523<I, V>) -> anyhow::Result<Timest
         .map_err(|e| anyhow::anyhow!("RTC read failed: {e:?}"))?;
     let unix = dt.timestamp() as i64;
     let (iso8601, date) = local_format(unix);
-    Ok(Timestamp { unix, iso8601, date })
+    Ok(Timestamp {
+        unix,
+        iso8601,
+        date,
+    })
 }
 
 /// Convert a UTC epoch into a local ISO-8601 string (with offset) and a local

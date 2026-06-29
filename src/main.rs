@@ -2,7 +2,7 @@
 //!
 //! Reads temperature + humidity from an SHT45 (I2C), timestamps each sample from a
 //! PCF8523 RTC (I2C), appends it to a daily CSV on the SD card (SPI/FAT), and serves
-//! a dashboard + CSV export over WiFi. A serial `WIPE` command clears the logs.
+//! a dashboard + CSV export over WiFi, with a web-configurable temperature offset.
 //!
 //! ── Pin map (Adafruit ESP32-S3 Feather #5477 + Adalogger FeatherWing #2922) ──
 //! VERIFY these against your board silkscreen / the Adalogger's CS solder jumper.
@@ -10,7 +10,6 @@
 mod config;
 mod rtc;
 mod sensor;
-mod serial_cmd;
 mod server;
 mod storage;
 
@@ -29,7 +28,7 @@ use esp_idf_svc::hal::prelude::*;
 use esp_idf_svc::hal::sd::{spi::SdSpiHostDriver, SdCardConfiguration, SdCardDriver};
 use esp_idf_svc::hal::spi::{config::DriverConfig, Dma, SpiDriver};
 use esp_idf_svc::io::vfs::MountedFatfs;
-use esp_idf_svc::nvs::EspDefaultNvsPartition;
+use esp_idf_svc::nvs::{EspDefaultNvsPartition, EspNvs};
 use esp_idf_svc::sntp::EspSntp;
 use esp_idf_svc::wifi::{
     AuthMethod, BlockingWifi, ClientConfiguration, Configuration as WifiConfiguration, EspWifi,
@@ -44,8 +43,10 @@ use server::Latest;
 
 /// Shared "latest reading", read by the `/api/latest` handler.
 pub type SharedLatest = Arc<Mutex<Option<Latest>>>;
-/// Serializes all SD/FAT access (the sampling writer vs. HTTP readers vs. WIPE).
+/// Serializes all SD/FAT access (the sampling writer vs. the HTTP readers).
 pub type SdGuard = Arc<Mutex<()>>;
+/// User temperature-calibration offset in °F, shared between the web UI and sampling.
+pub type Calibration = Arc<Mutex<f32>>;
 
 fn main() -> anyhow::Result<()> {
     // Required boilerplate for esp-idf-sys / runtime linking + logging.
@@ -104,6 +105,18 @@ fn main() -> anyhow::Result<()> {
     // ── WiFi (STA) + SNTP -> RTC + mDNS ────────────────────────────────────
     let sys_loop = EspSystemEventLoop::take()?;
     let nvs = EspDefaultNvsPartition::take()?;
+
+    // Persistent temperature-calibration offset (°F), stored in NVS as centi-°F so it
+    // survives reboots and SD-card reformats. Editable from the web UI.
+    let cal_nvs = EspNvs::new(nvs.clone(), "cal", true)?;
+    let calibration: Calibration = Arc::new(Mutex::new(
+        cal_nvs.get_i32("temp_off_cf")?.unwrap_or(0) as f32 / 100.0,
+    ));
+    log::info!(
+        "temperature offset: {:+.1} °F",
+        *calibration.lock().unwrap()
+    );
+
     let mut wifi = BlockingWifi::wrap(
         EspWifi::new(peripherals.modem, sys_loop.clone(), Some(nvs))?,
         sys_loop,
@@ -128,18 +141,19 @@ fn main() -> anyhow::Result<()> {
         }
     }
 
-    // ── HTTP server + serial command listener ──────────────────────────────
+    // ── HTTP server ────────────────────────────────────────────────────────
     let latest: SharedLatest = Arc::new(Mutex::new(None));
     let sd_guard: SdGuard = Arc::new(Mutex::new(()));
-    let _http = server::start(latest.clone(), sd_guard.clone())?;
-    serial_cmd::spawn(sd_guard.clone());
+    let _http = server::start(latest.clone(), sd_guard.clone(), calibration.clone())?;
 
     // ── Sampling loop ──────────────────────────────────────────────────────
     let interval_ms = (CONFIG.sample_interval_secs.max(1) * 1000) as u32;
     log::info!("logging every {}s", CONFIG.sample_interval_secs);
+    let mut last_persisted = *calibration.lock().unwrap();
     loop {
         match sample(&mut sht, &mut pcf, &mut delay) {
-            Ok((ts, s)) => {
+            Ok((ts, raw)) => {
+                let s = apply_calibration(raw, *calibration.lock().unwrap());
                 *latest.lock().unwrap() = Some(Latest {
                     iso8601: ts.iso8601.clone(),
                     temperature_c: s.temperature_c,
@@ -162,7 +176,30 @@ fn main() -> anyhow::Result<()> {
             }
             Err(e) => log::warn!("skipped sample: {e}"),
         }
+
+        // Persist the calibration offset to NVS if it was changed via the web UI.
+        let current = *calibration.lock().unwrap();
+        if (current - last_persisted).abs() > f32::EPSILON {
+            match cal_nvs.set_i32("temp_off_cf", (current * 100.0).round() as i32) {
+                Ok(()) => {
+                    last_persisted = current;
+                    log::info!("calibration saved to NVS: {current:+.1} °F");
+                }
+                Err(e) => log::error!("failed to save calibration: {e}"),
+            }
+        }
+
         FreeRtos::delay_ms(interval_ms);
+    }
+}
+
+/// Apply the user's temperature calibration offset (a delta in °F) to a raw sample.
+fn apply_calibration(s: sensor::Sample, offset_f: f32) -> sensor::Sample {
+    let temperature_c = s.temperature_c + offset_f * 5.0 / 9.0;
+    sensor::Sample {
+        temperature_c,
+        temperature_f: temperature_c * 9.0 / 5.0 + 32.0,
+        humidity_pct: s.humidity_pct,
     }
 }
 
@@ -286,4 +323,3 @@ fn scan_i2c(i2c: &mut I2cDriver<'_>) {
         log::info!("I2C scan: found {}", found.join(", "));
     }
 }
-

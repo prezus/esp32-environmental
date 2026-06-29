@@ -2,10 +2,11 @@
 
 use esp_idf_svc::http::server::{Configuration, EspHttpServer};
 use esp_idf_svc::http::Method;
-use esp_idf_svc::io::Write;
+use esp_idf_svc::io::Write as EspWrite;
+use std::io::{BufRead, BufReader};
 
 use crate::storage;
-use crate::{SdGuard, SharedLatest};
+use crate::{Calibration, SdGuard, SharedLatest};
 
 const JSON: &[(&str, &str)] = &[("Content-Type", "application/json")];
 
@@ -15,7 +16,11 @@ const CHART_JS_GZ: &[u8] = include_bytes!("../assets/chart.umd.min.js.gz");
 
 /// Build and start the HTTP server. The returned handle must be kept alive for the
 /// server to keep running.
-pub fn start(latest: SharedLatest, sd: SdGuard) -> anyhow::Result<EspHttpServer<'static>> {
+pub fn start(
+    latest: SharedLatest,
+    sd: SdGuard,
+    calibration: Calibration,
+) -> anyhow::Result<EspHttpServer<'static>> {
     let mut server = EspHttpServer::new(&Configuration {
         stack_size: 10_240,
         // The dashboard fires several requests at once (page, /chart.js, the APIs).
@@ -26,7 +31,8 @@ pub fn start(latest: SharedLatest, sd: SdGuard) -> anyhow::Result<EspHttpServer<
 
     // Dashboard.
     server.fn_handler::<anyhow::Error, _>("/", Method::Get, |req| {
-        req.into_ok_response()?.write_all(DASHBOARD_HTML.as_bytes())?;
+        req.into_ok_response()?
+            .write_all(DASHBOARD_HTML.as_bytes())?;
         Ok(())
     })?;
 
@@ -83,26 +89,11 @@ pub fn start(latest: SharedLatest, sd: SdGuard) -> anyhow::Result<EspHttpServer<
                 .write_all(b"missing or invalid 'date'")?;
             return Ok(());
         };
-        let rows = {
+        let result = {
             let _g = sd_data.lock().unwrap();
-            storage::read_rows(&date).unwrap_or_default()
+            stream_data_json(&date, req)
         };
-        let points: Vec<String> = rows
-            .iter()
-            .map(|(t, tc, tf, rh)| {
-                format!(
-                    "{{\"t\":\"{}\",\"tc\":{},\"tf\":{},\"rh\":{}}}",
-                    t,
-                    jnum(*tc),
-                    jnum(*tf),
-                    jnum(*rh)
-                )
-            })
-            .collect();
-        let body = format!("{{\"points\":[{}]}}", points.join(","));
-        req.into_response(200, Some("OK"), JSON)?
-            .write_all(body.as_bytes())?;
-        Ok(())
+        result
     })?;
 
     // Raw CSV download (export).
@@ -114,40 +105,41 @@ pub fn start(latest: SharedLatest, sd: SdGuard) -> anyhow::Result<EspHttpServer<
                 .write_all(b"missing or invalid 'date'")?;
             return Ok(());
         };
-        let csv = {
+        let result = {
             let _g = sd_dl.lock().unwrap();
-            storage::read_csv(&date)
+            stream_csv_download(&date, req)
         };
-        match csv {
-            Ok(body) => {
-                let disp = format!("attachment; filename=\"{date}.csv\"");
-                let headers = [
-                    ("Content-Type", "text/csv"),
-                    ("Content-Disposition", disp.as_str()),
-                ];
-                req.into_response(200, Some("OK"), &headers)?
-                    .write_all(body.as_bytes())?;
-            }
-            Err(_) => {
-                req.into_response(404, Some("Not Found"), &[])?
-                    .write_all(b"no such log file")?;
-            }
-        }
+        result
+    })?;
+
+    // Read the current temperature-calibration offset.
+    let cal_get = calibration.clone();
+    server.fn_handler::<anyhow::Error, _>("/api/config", Method::Get, move |req| {
+        let off = *cal_get.lock().unwrap();
+        let body = format!("{{\"temp_offset_f\":{}}}", jnum(off));
+        req.into_response(200, Some("OK"), JSON)?
+            .write_all(body.as_bytes())?;
         Ok(())
     })?;
 
-    // Wipe all logs (POST so it can't be triggered by a casual GET/prefetch).
-    // Reachable from the dashboard's "Wipe logs" button or `curl -X POST .../wipe`.
-    let sd_wipe = sd.clone();
-    server.fn_handler::<anyhow::Error, _>("/wipe", Method::Post, move |req| {
-        let removed = {
-            let _g = sd_wipe.lock().unwrap();
-            storage::wipe().unwrap_or(0)
-        };
-        log::info!("wipe via HTTP: removed {removed} log file(s)");
-        let body = format!("{{\"removed\":{removed}}}");
-        req.into_response(200, Some("OK"), JSON)?
-            .write_all(body.as_bytes())?;
+    // Set the temperature-calibration offset (°F), e.g. POST /api/config?temp_offset_f=-5
+    // The sampling loop applies it to new readings and persists it to NVS.
+    let cal_set = calibration.clone();
+    server.fn_handler::<anyhow::Error, _>("/api/config", Method::Post, move |req| {
+        match query_param(req.uri(), "temp_offset_f").and_then(|s| s.parse::<f32>().ok()) {
+            Some(v) if v.is_finite() => {
+                let v = v.clamp(-20.0, 20.0);
+                *cal_set.lock().unwrap() = v;
+                log::info!("temperature offset set via web: {v:+.1} °F");
+                let body = format!("{{\"temp_offset_f\":{}}}", jnum(v));
+                req.into_response(200, Some("OK"), JSON)?
+                    .write_all(body.as_bytes())?;
+            }
+            _ => {
+                req.into_response(400, Some("Bad Request"), &[])?
+                    .write_all(b"missing or invalid 'temp_offset_f'")?;
+            }
+        }
         Ok(())
     })?;
 
@@ -172,6 +164,80 @@ fn jnum(v: f32) -> String {
     } else {
         "null".to_string()
     }
+}
+
+fn stream_data_json(
+    date: &str,
+    req: esp_idf_svc::http::server::Request<&mut esp_idf_svc::http::server::EspHttpConnection>,
+) -> anyhow::Result<()> {
+    let file = match storage::open_csv(date) {
+        Ok(file) => file,
+        Err(_) => {
+            req.into_response(404, Some("Not Found"), &[])?
+                .write_all(b"no such log file")?;
+            return Ok(());
+        }
+    };
+
+    let mut resp = req.into_response(200, Some("OK"), JSON)?;
+    resp.write_all(b"{\"points\":[")?;
+    let mut first = true;
+    for line in BufReader::new(file).lines().skip(1) {
+        let line = line?;
+        let mut cols = line.split(',');
+        let iso = cols.next().unwrap_or_default();
+        let _unix = cols.next();
+        let tc = cols.next().and_then(|s| s.parse().ok()).unwrap_or(f32::NAN);
+        let tf = cols.next().and_then(|s| s.parse().ok()).unwrap_or(f32::NAN);
+        let rh = cols.next().and_then(|s| s.parse().ok()).unwrap_or(f32::NAN);
+        if iso.is_empty() {
+            continue;
+        }
+        if !first {
+            resp.write_all(b",")?;
+        }
+        first = false;
+        let point = format!(
+            "{{\"t\":\"{}\",\"tc\":{},\"tf\":{},\"rh\":{}}}",
+            iso,
+            jnum(tc),
+            jnum(tf),
+            jnum(rh)
+        );
+        resp.write_all(point.as_bytes())?;
+    }
+    resp.write_all(b"]}")?;
+    Ok(())
+}
+
+fn stream_csv_download(
+    date: &str,
+    req: esp_idf_svc::http::server::Request<&mut esp_idf_svc::http::server::EspHttpConnection>,
+) -> anyhow::Result<()> {
+    let mut file = match storage::open_csv(date) {
+        Ok(file) => file,
+        Err(_) => {
+            req.into_response(404, Some("Not Found"), &[])?
+                .write_all(b"no such log file")?;
+            return Ok(());
+        }
+    };
+
+    let disp = format!("attachment; filename=\"{date}.csv\"");
+    let headers = [
+        ("Content-Type", "text/csv"),
+        ("Content-Disposition", disp.as_str()),
+    ];
+    let mut resp = req.into_response(200, Some("OK"), &headers)?;
+    let mut buf = [0u8; 1024];
+    loop {
+        let n = std::io::Read::read(&mut file, &mut buf)?;
+        if n == 0 {
+            break;
+        }
+        resp.write_all(&buf[..n])?;
+    }
+    Ok(())
 }
 
 /// Extract a query parameter value from a URI like "/api/data?date=2026-06-26".
@@ -214,7 +280,13 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
 <div class="controls">
   <label>Day: <select id="day"></select></label>
   <a class="dl" id="dl" href="#">Download CSV</a>
-  <button id="wipe" style="margin-left:1rem">Wipe logs</button>
+</div>
+<div class="controls">
+  <label>Temp calibration offset (&deg;F):
+    <input id="off" type="number" step="0.1" style="width:6rem">
+  </label>
+  <button id="saveCal">Save</button>
+  <span id="calMsg" style="margin-left:.5rem;color:#666"></span>
 </div>
 <h2>Temperature</h2>
 <div class="chart-wrap"><canvas id="tempChart" height="120"></canvas></div>
@@ -272,18 +344,23 @@ async function loadDay(date) {
     }, Object.assign({}, base, { scales: { y: { title: { display: true, text: '% RH' }, suggestedMin: 0, suggestedMax: 100 } } }));
   } catch (e) {}
 }
-document.getElementById('day').addEventListener('change', e => loadDay(e.target.value));
-document.getElementById('wipe').addEventListener('click', async () => {
-  if (!confirm('Delete ALL logged data on the SD card? This cannot be undone.')) return;
+async function loadConfig() {
   try {
-    const r = await (await fetch('/wipe', { method: 'POST' })).json();
-    alert('Wiped ' + r.removed + ' file(s).');
-    if (tempChart) { tempChart.destroy(); tempChart = null; }
-    if (humChart) { humChart.destroy(); humChart = null; }
-    loadDays();
-  } catch (e) { alert('Wipe failed: ' + e); }
+    const c = await (await fetch('/api/config')).json();
+    document.getElementById('off').value = (c.temp_offset_f ?? 0).toFixed(1);
+  } catch (e) {}
+}
+document.getElementById('day').addEventListener('change', e => loadDay(e.target.value));
+document.getElementById('saveCal').addEventListener('click', async () => {
+  const v = parseFloat(document.getElementById('off').value || '0');
+  const msg = document.getElementById('calMsg');
+  try {
+    const c = await (await fetch('/api/config?temp_offset_f=' + encodeURIComponent(v), { method: 'POST' })).json();
+    document.getElementById('off').value = (c.temp_offset_f ?? 0).toFixed(1);
+    msg.textContent = 'Saved ' + (c.temp_offset_f >= 0 ? '+' : '') + c.temp_offset_f.toFixed(1) + '°F. Applies to new readings.';
+  } catch (e) { msg.textContent = 'Save failed'; }
 });
-loadLatest(); loadDays();
+loadLatest(); loadDays(); loadConfig();
 setInterval(loadLatest, 5000);
 setInterval(() => { const s = document.getElementById('day'); if (s.value) loadDay(s.value); }, 30000);
 </script>
