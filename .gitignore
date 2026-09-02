@@ -2,5 +2,6 @@
 /.embuild
 # Real secrets live here; keep them out of git. Use cfg.toml.example as the template.
 /cfg.toml
+/.prototype-secrets/
 *.log
 .DS_Store

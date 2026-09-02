@@ -7,18 +7,23 @@
 //! ── Pin map (Adafruit ESP32-S3 Feather #5477 + Adalogger FeatherWing #2922) ──
 //! VERIFY these against your board silkscreen / the Adalogger's CS solder jumper.
 
+mod aws_iot;
+mod aws_spool;
 mod config;
+mod ota;
 mod rtc;
 mod sensor;
 mod server;
 mod storage;
 
 use std::cell::RefCell;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
 use anyhow::anyhow;
 use embedded_hal::i2c::I2c;
 use embedded_hal_bus::i2c::RefCellDevice;
+use environmental_core::{EnvironmentalData, TelemetryEnvelope, TimeQuality};
 use esp_idf_svc::eventloop::EspSystemEventLoop;
 use esp_idf_svc::fs::fatfs::Fatfs;
 use esp_idf_svc::hal::delay::{Delay, FreeRtos};
@@ -101,6 +106,9 @@ fn main() -> anyhow::Result<()> {
     let _fs = MountedFatfs::mount(Fatfs::new_sdcard(0, sd_card)?, storage::MOUNT_POINT, 4)?;
     storage::init()?;
     log::info!("SD card mounted at {}", storage::MOUNT_POINT);
+    if let Err(error) = ota::confirm_running_image() {
+        log::info!("running image did not require OTA validity confirmation: {error:#}");
+    }
 
     // ── WiFi (STA) + SNTP -> RTC + mDNS ────────────────────────────────────
     let sys_loop = EspSystemEventLoop::take()?;
@@ -141,14 +149,40 @@ fn main() -> anyhow::Result<()> {
         }
     }
 
-    // ── HTTP server ────────────────────────────────────────────────────────
+    // ── HTTP server and optional AWS delivery worker ───────────────────────
     let latest: SharedLatest = Arc::new(Mutex::new(None));
     let sd_guard: SdGuard = Arc::new(Mutex::new(()));
     let _http = server::start(latest.clone(), sd_guard.clone(), calibration.clone())?;
+    let sample_interval_seconds = Arc::new(AtomicU32::new(
+        CONFIG.sample_interval_secs.max(10).min(u32::MAX as u64) as u32,
+    ));
+    let aws_spool = aws_spool::AwsSpool::new(sd_guard.clone());
+    let aws_context = if CONFIG.aws_iot_enabled {
+        let aws_config = aws_iot::AwsIotConfig::load(CONFIG.aws_iot_config_path)?;
+        let boot_id = format!(
+            "{:08x}{:08x}{:08x}{:08x}",
+            unsafe { esp_idf_svc::sys::esp_random() },
+            unsafe { esp_idf_svc::sys::esp_random() },
+            unsafe { esp_idf_svc::sys::esp_random() },
+            unsafe { esp_idf_svc::sys::esp_random() },
+        );
+        let device_id = aws_config.device_id.clone();
+        let _worker = aws_iot::start_delivery_worker(
+            aws_config,
+            aws_spool.clone(),
+            sample_interval_seconds.clone(),
+            calibration.clone(),
+        )?;
+        Some((aws_spool, device_id, boot_id, _worker))
+    } else {
+        None
+    };
 
     // ── Sampling loop ──────────────────────────────────────────────────────
-    let interval_ms = (CONFIG.sample_interval_secs.max(1) * 1000) as u32;
-    log::info!("logging every {}s", CONFIG.sample_interval_secs);
+    log::info!(
+        "logging every {}s",
+        sample_interval_seconds.load(Ordering::Acquire)
+    );
     let mut last_persisted = *calibration.lock().unwrap();
     loop {
         match sample(&mut sht, &mut pcf, &mut delay) {
@@ -164,6 +198,31 @@ fn main() -> anyhow::Result<()> {
                     let _g = sd_guard.lock().unwrap();
                     if let Err(e) = storage::append(&ts, &s) {
                         log::error!("CSV append failed: {e}");
+                    }
+                }
+                if let Some((spool, device_id, boot_id, _worker)) = &aws_context {
+                    let enqueue = (|| -> anyhow::Result<()> {
+                        let sequence = spool.reserve_sequence()?;
+                        let envelope = TelemetryEnvelope::new(
+                            format!("{device_id}:{sequence}"),
+                            device_id.clone(),
+                            boot_id.clone(),
+                            sequence,
+                            rtc::utc_iso8601(ts.unix)?,
+                            TimeQuality::Rtc,
+                            EnvironmentalData {
+                                temperature_c: s.temperature_c,
+                                temperature_f: s.temperature_f,
+                                humidity_percent: s.humidity_pct,
+                                calibration_offset_f: *calibration
+                                    .lock()
+                                    .map_err(|_| anyhow!("calibration mutex poisoned"))?,
+                            },
+                        );
+                        spool.enqueue(&envelope)
+                    })();
+                    if let Err(error) = enqueue {
+                        log::error!("AWS spool append failed; CSV remains available: {error:#}");
                     }
                 }
                 log::info!(
@@ -189,6 +248,9 @@ fn main() -> anyhow::Result<()> {
             }
         }
 
+        let interval_ms = sample_interval_seconds
+            .load(Ordering::Acquire)
+            .saturating_mul(1_000);
         FreeRtos::delay_ms(interval_ms);
     }
 }

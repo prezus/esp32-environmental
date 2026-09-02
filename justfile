@@ -28,7 +28,15 @@ fmt:
     {{export-esp}} && cargo fmt
 
 clippy:
-    {{export-esp}} && cargo clippy --release
+    {{export-esp}} && cargo clippy --release -- -D warnings
+
+test:
+    cargo +stable test -p environmental-core --target aarch64-apple-darwin
+
+ci:
+    {{export-esp}} && cargo fmt --all -- --check
+    {{export-esp}} && cargo clippy --release -- -D warnings
+    cargo +stable test -p environmental-core --target aarch64-apple-darwin
 
 # Remove build artifacts.
 clean:

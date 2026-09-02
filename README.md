@@ -131,3 +131,52 @@ the board first; use the offset to fine-tune.
 - **Time**: on boot with WiFi, SNTP syncs the system clock and writes it into the RTC. The RTC (battery-backed) then provides timestamps even offline.
 
 All SD access is serialized by a mutex so the writer and HTTP readers don't collide.
+
+## AWS IoT Core prototype branch
+
+The `prototype/aws-iot-core` branch adds a generic prototype identity,
+`mothership-prototype-environment-monitor-01`, without associating it with a
+production location. AWS is off by default. When enabled in ignored `cfg.toml`,
+the device reads its endpoint and X.509 paths from `/sdcard/aws-iot.json`:
+
+```toml
+aws_iot_enabled = true
+aws_iot_config_path = "/sdcard/aws-iot.json"
+```
+
+```json
+{
+  "endpoint": "your-endpoint-ats.iot.us-west-2.amazonaws.com",
+  "clientId": "mothership-prototype-environment-monitor-01",
+  "thingName": "mothership-prototype-environment-monitor-01",
+  "deviceId": "mothership-prototype-environment-monitor-01",
+  "certificatePath": "/sdcard/aws/device-certificate.pem",
+  "privateKeyPath": "/sdcard/aws/device-private-key.pem"
+}
+```
+
+Each RTC-stamped SHT45 sample remains in the existing daily CSV and is also
+appended to an SD JSON-lines spool with a durable device-global sequence. MQTT
+runs over TLS TCP 443 with `x-amzn-mqtt-ca`, a retained Last Will, a persistent
+session, and per-device topics. MQTT PUBACK never removes a spool record; only a
+matching accepted/duplicate application ACK after D1 commit removes its head.
+
+Device Shadow desired state controls `sampleIntervalSeconds` (10–3600) and
+`temperatureOffsetF` (-20–20). Values are applied and then reported; unknown or
+partial configuration is rejected. AWS Jobs requests the next execution on
+each session. An applicable `install` document downloads a signed image over
+HTTPS into the inactive OTA slot, publishes execution status, and reboots.
+
+The 4 MB flash layout contains two 1.875 MiB OTA slots; current flash sections
+occupy about 1.29 MB. Signed-update mode uses the public key from the running
+signed image, so the first image flashed must also be signed. Keep the RSA-3072
+private key beneath `.prototype-secrets/` and build the artifact with:
+
+```sh
+scripts/build-signed-image.sh .prototype-secrets/ota-signing-key.pem
+```
+
+Do not use `just flash` for this branch until the explicit signed-initial-image
+procedure has been reviewed and hardware flashing has been separately approved.
+No connected-device, SD power-loss, MQTT heap, Jobs, signature, or rollback
+claim is proven by a successful build.

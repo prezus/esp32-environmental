@@ -14,3 +14,6 @@ build-std = ["std", "panic_abort"]
 MCU = "esp32s3"
 # ESP-IDF version pulled and built by esp-idf-sys on the first compile.
 ESP_IDF_VERSION = "v5.3.3"
+# esp-idf-sys builds a generated C project; copy the tracked OTA partition table there.
+ESP_IDF_GLOB_PROJECT_BASE = { value = ".", relative = true }
+ESP_IDF_GLOB_PROJECT_PARTITIONS = "partitions.csv"

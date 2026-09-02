@@ -59,6 +59,19 @@ pub fn now<I: I2c, V: Variant>(rtc: &mut Pcf8523<I, V>) -> anyhow::Result<Timest
 
 /// Convert a UTC epoch into a local ISO-8601 string (with offset) and a local
 /// "YYYY-MM-DD" date, using libc `localtime_r` (honours the process `TZ`).
+pub fn utc_iso8601(unix: i64) -> anyhow::Result<String> {
+    let dt = OffsetDateTime::from_unix_timestamp(unix)?;
+    Ok(format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.000Z",
+        dt.year(),
+        dt.month() as u8,
+        dt.day(),
+        dt.hour(),
+        dt.minute(),
+        dt.second()
+    ))
+}
+
 fn local_format(unix: i64) -> (String, String) {
     use esp_idf_svc::sys::{localtime_r, time_t, tm};
 
