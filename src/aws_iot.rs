@@ -11,7 +11,7 @@ use anyhow::{bail, Context};
 use environmental_core::{
     job_status, parse_application_ack, parse_next_job, parse_shadow_document, reported_shadow,
 };
-use esp_idf_svc::io::{Read, Write};
+use esp_idf_svc::io::Write;
 use esp_idf_svc::tls::{Config as TlsConfig, EspTls, InternalSocket, X509};
 
 const PORT: u16 = 443;
@@ -527,45 +527,48 @@ fn encode_remaining_length(mut length: usize, target: &mut Vec<u8>) {
     }
 }
 
-fn write_all<W: Write>(writer: &mut W, mut bytes: &[u8]) -> anyhow::Result<()>
-where
-    W::Error: core::fmt::Debug,
-{
+fn write_all(writer: &mut EspTls<InternalSocket>, mut bytes: &[u8]) -> anyhow::Result<()> {
     while !bytes.is_empty() {
-        let written = writer
-            .write(bytes)
-            .map_err(|error| anyhow::anyhow!("TLS write failed: {error:?}"))?;
-        if written == 0 {
-            bail!("TLS write returned zero");
+        match writer.write(bytes) {
+            Ok(0) => bail!("TLS write returned zero"),
+            Ok(written) => bytes = &bytes[written..],
+            Err(error) if is_tls_retry(error.code()) => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => bail!("TLS write failed: {error:?}"),
         }
-        bytes = &bytes[written..];
     }
-    writer
-        .flush()
-        .map_err(|error| anyhow::anyhow!("TLS flush failed: {error:?}"))
+    loop {
+        match writer.flush() {
+            Ok(()) => return Ok(()),
+            Err(error) if is_tls_retry(error.0.code()) => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => bail!("TLS flush failed: {error:?}"),
+        }
+    }
 }
 
-fn read_exact<R: Read>(reader: &mut R, mut bytes: &mut [u8]) -> anyhow::Result<()>
-where
-    R::Error: core::fmt::Debug,
-{
+fn read_exact(reader: &mut EspTls<InternalSocket>, mut bytes: &mut [u8]) -> anyhow::Result<()> {
     while !bytes.is_empty() {
-        let count = reader
-            .read(bytes)
-            .map_err(|error| anyhow::anyhow!("TLS read failed: {error:?}"))?;
-        if count == 0 {
-            bail!("TLS connection closed");
+        match reader.read(bytes) {
+            Ok(0) => bail!("TLS connection closed"),
+            Ok(count) => bytes = &mut bytes[count..],
+            Err(error) if is_tls_retry(error.code()) => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => bail!("TLS read failed: {error:?}"),
         }
-        bytes = &mut bytes[count..];
     }
     Ok(())
 }
 
-fn read_byte<R: Read>(reader: &mut R) -> anyhow::Result<u8>
-where
-    R::Error: core::fmt::Debug,
-{
+fn read_byte(reader: &mut EspTls<InternalSocket>) -> anyhow::Result<u8> {
     let mut byte = [0];
     read_exact(reader, &mut byte)?;
     Ok(byte[0])
+}
+
+fn is_tls_retry(code: i32) -> bool {
+    matches!(code, -0x6900 | -0x6880)
 }
