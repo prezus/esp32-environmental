@@ -8,6 +8,3 @@ wifi_psk = "YOUR_WIFI_PASSWORD"
 sample_interval_secs = 30
 # Hostname advertised over mDNS -> reachable at http://<hostname>.local
 hostname = "esp32-env"
-# AWS credentials stay on SD; this switch and path are non-secret.
-aws_iot_enabled = false
-aws_iot_config_path = "/sdcard/aws-iot.json"

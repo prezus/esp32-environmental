@@ -10,6 +10,9 @@
 mod aws_iot;
 mod aws_spool;
 mod config;
+mod device_bundle {
+    include!(concat!(env!("OUT_DIR"), "/device_bundle.rs"));
+}
 mod ota;
 mod rtc;
 mod sensor;
@@ -132,7 +135,12 @@ fn main() -> anyhow::Result<()> {
     // These handles must outlive the program: dropping them tears down WiFi / SNTP.
     let mut _wifi = None;
     let mut _sntp = None;
-    match connect_wifi(&mut wifi) {
+    let (wifi_ssid, wifi_psk) = if device_bundle::ENABLED {
+        (device_bundle::WIFI_SSID, device_bundle::WIFI_PSK)
+    } else {
+        (CONFIG.wifi_ssid, CONFIG.wifi_psk)
+    };
+    match connect_wifi(&mut wifi, wifi_ssid, wifi_psk) {
         Ok(()) => {
             let sntp = EspSntp::new_default()?;
             if wait_for_time(20_000) {
@@ -157,8 +165,13 @@ fn main() -> anyhow::Result<()> {
         CONFIG.sample_interval_secs.max(10).min(u32::MAX as u64) as u32,
     ));
     let aws_spool = aws_spool::AwsSpool::new(sd_guard.clone());
-    let aws_context = if CONFIG.aws_iot_enabled {
-        let aws_config = aws_iot::AwsIotConfig::load(CONFIG.aws_iot_config_path)?;
+    let aws_context = if device_bundle::ENABLED {
+        let aws_config = aws_iot::AwsIotConfig::embedded(
+            device_bundle::AWS_IOT_ENDPOINT,
+            device_bundle::DEVICE_ID,
+            device_bundle::DEVICE_CERTIFICATE_PEM,
+            device_bundle::DEVICE_PRIVATE_KEY_PEM,
+        )?;
         let boot_id = format!(
             "{:08x}{:08x}{:08x}{:08x}",
             unsafe { esp_idf_svc::sys::esp_random() },
@@ -276,20 +289,20 @@ fn sample<I: I2c, V: Variant>(
     Ok((ts, s))
 }
 
-fn connect_wifi(wifi: &mut BlockingWifi<EspWifi<'static>>) -> anyhow::Result<()> {
-    if CONFIG.wifi_ssid.is_empty() {
-        return Err(anyhow!("wifi_ssid not set in cfg.toml"));
+fn connect_wifi(
+    wifi: &mut BlockingWifi<EspWifi<'static>>,
+    wifi_ssid: &str,
+    wifi_psk: &str,
+) -> anyhow::Result<()> {
+    if wifi_ssid.is_empty() {
+        return Err(anyhow!("Wi-Fi SSID is not configured"));
     }
     wifi.set_configuration(&WifiConfiguration::Client(ClientConfiguration {
-        ssid: CONFIG
-            .wifi_ssid
-            .try_into()
-            .map_err(|_| anyhow!("SSID too long"))?,
-        password: CONFIG
-            .wifi_psk
+        ssid: wifi_ssid.try_into().map_err(|_| anyhow!("SSID too long"))?,
+        password: wifi_psk
             .try_into()
             .map_err(|_| anyhow!("password too long"))?,
-        auth_method: if CONFIG.wifi_psk.is_empty() {
+        auth_method: if wifi_psk.is_empty() {
             AuthMethod::None
         } else {
             AuthMethod::WPA2Personal

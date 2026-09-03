@@ -12,8 +12,4 @@ pub struct Config {
     pub sample_interval_secs: u64,
     #[default("esp32-env")]
     pub hostname: &'static str,
-    #[default(false)]
-    pub aws_iot_enabled: bool,
-    #[default("/sdcard/aws-iot.json")]
-    pub aws_iot_config_path: &'static str,
 }

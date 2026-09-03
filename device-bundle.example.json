@@ -1,0 +1,8 @@
+{
+  "wifiSsid": "YOUR_WIFI_SSID",
+  "wifiPsk": "YOUR_WIFI_PASSWORD",
+  "awsIotEndpoint": "YOUR_ENDPOINT-ats.iot.us-west-2.amazonaws.com",
+  "deviceId": "mothership-prototype-environment-monitor-01",
+  "certificateFile": "device-certificate.pem",
+  "privateKeyFile": "device-private-key.pem"
+}

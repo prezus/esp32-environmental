@@ -1,44 +1,49 @@
 //! AWS IoT Core prototype transport over MQTT/TLS 443 with ALPN.
 
 use std::collections::VecDeque;
-use std::fs;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use crate::aws_spool::AwsSpool;
+use crate::{ota, Calibration};
 use anyhow::{bail, Context};
 use environmental_core::{
     job_status, parse_application_ack, parse_next_job, parse_shadow_document, reported_shadow,
 };
 use esp_idf_svc::io::{Read, Write};
 use esp_idf_svc::tls::{Config as TlsConfig, EspTls, InternalSocket, X509};
-use serde::Deserialize;
-
-use crate::aws_spool::AwsSpool;
-use crate::{ota, Calibration};
 
 const PORT: u16 = 443;
 const ALPN: &str = "x-amzn-mqtt-ca";
 const MAX_PACKET_BYTES: usize = 16 * 1024;
 const MAX_QUEUED_MESSAGES: usize = 8;
 
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[derive(Debug, Clone)]
 pub struct AwsIotConfig {
     pub endpoint: String,
     pub client_id: String,
     pub thing_name: String,
     pub device_id: String,
-    pub certificate_path: String,
-    pub private_key_path: String,
+    pub certificate_pem: &'static [u8],
+    pub private_key_pem: &'static [u8],
 }
 
 impl AwsIotConfig {
-    pub fn load(path: &str) -> anyhow::Result<Self> {
-        let config: Self = serde_json::from_slice(
-            &fs::read(path).with_context(|| format!("failed to read {path}"))?,
-        )
-        .with_context(|| format!("failed to parse {path}"))?;
+    pub fn embedded(
+        endpoint: &str,
+        device_id: &str,
+        certificate_pem: &'static [u8],
+        private_key_pem: &'static [u8],
+    ) -> anyhow::Result<Self> {
+        let config = Self {
+            endpoint: endpoint.into(),
+            client_id: device_id.into(),
+            thing_name: device_id.into(),
+            device_id: device_id.into(),
+            certificate_pem,
+            private_key_pem,
+        };
         config.validate()?;
         Ok(config)
     }
@@ -49,10 +54,16 @@ impl AwsIotConfig {
             ("clientId", self.client_id.as_str()),
             ("thingName", self.thing_name.as_str()),
             ("deviceId", self.device_id.as_str()),
-            ("certificatePath", self.certificate_path.as_str()),
-            ("privateKeyPath", self.private_key_path.as_str()),
         ] {
             if value.is_empty() || value.as_bytes().contains(&0) {
+                bail!("AWS IoT {name} is empty or contains NUL");
+            }
+        }
+        for (name, value) in [
+            ("certificatePem", self.certificate_pem),
+            ("privateKeyPem", self.private_key_pem),
+        ] {
+            if value.is_empty() || value.contains(&0) {
                 bail!("AWS IoT {name} is empty or contains NUL");
             }
         }
@@ -165,9 +176,8 @@ fn run_session(
         }
     }
 
-    for envelope in spool.pending(8)? {
-        let payload = serde_json::to_vec(&envelope)?;
-        client.publish_telemetry(&payload)?;
+    for record in spool.pending(8)? {
+        client.publish_telemetry(&record.payload)?;
         loop {
             let (topic, payload) = client.read_publish()?;
             if let Some(event_id) = process_control(
@@ -177,7 +187,7 @@ fn run_session(
                 sample_interval_seconds,
                 calibration,
             )? {
-                if event_id == envelope.event_id {
+                if event_id == record.event_id {
                     spool.acknowledge_head(&event_id)?;
                     break;
                 }
@@ -280,8 +290,8 @@ struct MqttClient {
 
 impl MqttClient {
     fn connect(config: AwsIotConfig) -> anyhow::Result<Self> {
-        let certificate = read_pem(&config.certificate_path, "device certificate")?;
-        let private_key = read_pem(&config.private_key_path, "device private key")?;
+        let certificate = nul_terminated_pem(config.certificate_pem, "device certificate")?;
+        let private_key = nul_terminated_pem(config.private_key_pem, "device private key")?;
         let mut tls = EspTls::new().context("failed to allocate ESP-TLS")?;
         let alpn = [ALPN];
         let tls_config = TlsConfig {
@@ -474,15 +484,12 @@ impl MqttClient {
     }
 }
 
-fn read_pem(path: &str, description: &str) -> anyhow::Result<Vec<u8>> {
-    let mut bytes =
-        fs::read(path).with_context(|| format!("failed to read {description} {path}"))?;
-    if bytes.is_empty() {
-        bail!("{description} is empty");
+fn nul_terminated_pem(pem: &[u8], description: &str) -> anyhow::Result<Vec<u8>> {
+    if pem.is_empty() || pem.contains(&0) {
+        bail!("{description} is empty or contains NUL");
     }
-    if bytes.last() != Some(&0) {
-        bytes.push(0);
-    }
+    let mut bytes = pem.to_vec();
+    bytes.push(0);
     Ok(bytes)
 }
 

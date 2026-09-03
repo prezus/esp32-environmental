@@ -1,5 +1,5 @@
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead, BufReader, Seek, SeekFrom, Write};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{bail, Context};
@@ -13,6 +13,11 @@ const SEQUENCE_PATH: &str = "/sdcard/aws-iot-sequence";
 const SEQUENCE_TEMP_PATH: &str = "/sdcard/aws-iot-sequence.tmp";
 const MAX_SPOOL_BYTES: u64 = 64 * 1024 * 1024;
 const COMPACT_AFTER_BYTES: u64 = 1024 * 1024;
+
+pub struct PendingRecord {
+    pub event_id: String,
+    pub payload: Vec<u8>,
+}
 
 #[derive(Clone)]
 pub struct AwsSpool {
@@ -63,6 +68,8 @@ impl AwsSpool {
             .create(true)
             .append(true)
             .open(SPOOL_PATH)?;
+        file.write_all(envelope.event_id.as_bytes())?;
+        file.write_all(b"\t")?;
         file.write_all(&bytes)?;
         file.write_all(b"\n")?;
         file.sync_data()?;
@@ -70,7 +77,7 @@ impl AwsSpool {
     }
 
     /// Read a bounded oldest-first batch without loading the full offline backlog.
-    pub fn pending(&self, limit: usize) -> anyhow::Result<Vec<TelemetryEnvelope>> {
+    pub fn pending(&self, limit: usize) -> anyhow::Result<Vec<PendingRecord>> {
         let _guard = self
             .sd_guard
             .lock()
@@ -88,10 +95,17 @@ impl AwsSpool {
             if !line.ends_with('\n') {
                 break;
             }
-            records.push(
-                serde_json::from_str(line.trim_end_matches('\n'))
-                    .context("invalid AWS spool record")?,
-            );
+            let (event_id, payload) = line
+                .trim_end_matches('\n')
+                .split_once('\t')
+                .context("invalid AWS spool record")?;
+            if event_id.is_empty() || payload.is_empty() {
+                bail!("invalid AWS spool record");
+            }
+            records.push(PendingRecord {
+                event_id: event_id.to_owned(),
+                payload: payload.as_bytes().to_vec(),
+            });
         }
         Ok(records)
     }
@@ -110,8 +124,12 @@ impl AwsSpool {
         if !line.ends_with('\n') {
             bail!("application ACK arrived for a torn spool record");
         }
-        let record: TelemetryEnvelope = serde_json::from_str(line.trim_end_matches('\n'))?;
-        if record.event_id != event_id {
+        let stored_event_id = line
+            .trim_end_matches('\n')
+            .split_once('\t')
+            .map(|(stored_event_id, _)| stored_event_id)
+            .context("invalid AWS spool record")?;
+        if stored_event_id != event_id {
             bail!("application ACK does not match the oldest durable event");
         }
         write_cursor(reader.stream_position()?)
@@ -160,22 +178,32 @@ fn compact_if_needed() -> anyhow::Result<()> {
 }
 
 fn repair_torn_tail() -> anyhow::Result<()> {
-    let bytes = match fs::read(SPOOL_PATH) {
-        Ok(bytes) => bytes,
+    let mut file = match OpenOptions::new().read(true).write(true).open(SPOOL_PATH) {
+        Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(error.into()),
     };
-    if bytes.is_empty() || bytes.last() == Some(&b'\n') {
+    let mut position = file.metadata()?.len();
+    if position == 0 {
         return Ok(());
     }
-    let complete_length = bytes
-        .iter()
-        .rposition(|byte| *byte == b'\n')
-        .map_or(0, |index| index + 1);
-    OpenOptions::new()
-        .write(true)
-        .open(SPOOL_PATH)?
-        .set_len(complete_length as u64)?;
+    let mut byte = [0];
+    file.seek(SeekFrom::Start(position - 1))?;
+    file.read_exact(&mut byte)?;
+    if byte[0] == b'\n' {
+        return Ok(());
+    }
+    while position > 0 {
+        position -= 1;
+        file.seek(SeekFrom::Start(position))?;
+        file.read_exact(&mut byte)?;
+        if byte[0] == b'\n' {
+            position += 1;
+            break;
+        }
+    }
+    file.set_len(position)?;
+    file.sync_data()?;
     Ok(())
 }
 

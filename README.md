@@ -61,7 +61,8 @@ hostname  = "esp32-env"   # reserved for future mDNS; unused today
 ```
 
 `cfg.toml` is gitignored. Leave `wifi_ssid` empty to run offline (RTC timestamps only,
-no dashboard).
+no dashboard). A device-specific bundle overrides these Wi-Fi values for an all-in-one
+AWS prototype image, as described below.
 
 ## Build / flash / monitor
 
@@ -136,27 +137,30 @@ All SD access is serialized by a mutex so the writer and HTTP readers don't coll
 
 The `prototype/aws-iot-core` branch adds a generic prototype identity,
 `mothership-prototype-environment-monitor-01`, without associating it with a
-production location. AWS is off by default. When enabled in ignored `cfg.toml`,
-the device reads its endpoint and X.509 paths from `/sdcard/aws-iot.json`:
-
-```toml
-aws_iot_enabled = true
-aws_iot_config_path = "/sdcard/aws-iot.json"
-```
+production location. AWS is off in an ordinary build. For this test, the signed
+initial image is device-specific and embeds Wi-Fi settings, the AWS endpoint,
+and the CSR-issued X.509 certificate/private key. Copy
+[`device-bundle.example.json`](device-bundle.example.json) beneath
+`.prototype-secrets/`, put its PEM files beside it, and fill in the values:
 
 ```json
 {
-  "endpoint": "your-endpoint-ats.iot.us-west-2.amazonaws.com",
-  "clientId": "mothership-prototype-environment-monitor-01",
-  "thingName": "mothership-prototype-environment-monitor-01",
+  "wifiSsid": "YOUR_WIFI_SSID",
+  "wifiPsk": "YOUR_WIFI_PASSWORD",
+  "awsIotEndpoint": "your-endpoint-ats.iot.us-west-2.amazonaws.com",
   "deviceId": "mothership-prototype-environment-monitor-01",
-  "certificatePath": "/sdcard/aws/device-certificate.pem",
-  "privateKeyPath": "/sdcard/aws/device-private-key.pem"
+  "certificateFile": "device-certificate.pem",
+  "privateKeyFile": "device-private-key.pem"
 }
 ```
 
+The build reads this ignored file only when `MOTHERSHIP_DEVICE_BUNDLE` is set.
+Generated Rust, ELF, and binary files remain under ignored `target/` and
+`.prototype-secrets/`. Treat every resulting image as a credential: do not
+publish it, and revoke its IoT certificate when the test ends.
+
 Each RTC-stamped SHT45 sample remains in the existing daily CSV and is also
-appended to an SD JSON-lines spool with a durable device-global sequence. MQTT
+appended to a durable SD journal with a device-global sequence. MQTT
 runs over TLS TCP 443 with `x-amzn-mqtt-ca`, a retained Last Will, a persistent
 session, and per-device topics. MQTT PUBACK never removes a spool record; only a
 matching accepted/duplicate application ACK after D1 commit removes its head.
@@ -173,10 +177,24 @@ signed image, so the first image flashed must also be signed. Keep the RSA-3072
 private key beneath `.prototype-secrets/` and build the artifact with:
 
 ```sh
-scripts/build-signed-image.sh .prototype-secrets/ota-signing-key.pem
+scripts/build-signed-image.sh \
+  .prototype-secrets/ota-signing-key.pem \
+  .prototype-secrets/device-01/device-bundle.json
 ```
 
-Do not use `just flash` for this branch until the explicit signed-initial-image
-procedure has been reviewed and hardware flashing has been separately approved.
+After separately approving the destructive hardware step, flash the complete
+signed initial bundle with an explicitly selected port:
+
+```sh
+scripts/flash-signed-initial.sh \
+  /dev/cu.usbmodemXXXX \
+  .prototype-secrets/device-01/image \
+  --erase-and-flash
+```
+
+The script verifies all hashes, refuses `/dev/cu.usbserial-110`, erases the
+selected board, and writes the bootloader at `0x0`, partition table at `0x8000`,
+initial OTA data at `0xf000`, and signed application in `ota_0` at `0x20000`.
+Do not use `just flash` for this branch.
 No connected-device, SD power-loss, MQTT heap, Jobs, signature, or rollback
 claim is proven by a successful build.
