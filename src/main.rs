@@ -60,6 +60,7 @@ fn main() -> anyhow::Result<()> {
     // Required boilerplate for esp-idf-sys / runtime linking + logging.
     esp_idf_svc::sys::link_patches();
     esp_idf_svc::log::EspLogger::initialize_default();
+    log::info!("firmware version {}", env!("CARGO_PKG_VERSION"));
 
     // Localize displayed timestamps to US Mountain Time (handles MST/MDT automatically).
     set_timezone("MST7MDT,M3.2.0,M11.1.0");
