@@ -348,15 +348,22 @@ impl MqttClient {
             body.push(1);
         }
         self.write_packet(0x82, &body)?;
-        let (header, response) = self.read_packet()?;
-        if header >> 4 != 9
-            || response.get(..2) != Some(&packet_id.to_be_bytes())
-            || response.len() != topics.len() + 2
-            || response[2..].iter().any(|code| !matches!(code, 0 | 1))
-        {
-            bail!("AWS IoT rejected MQTT subscription");
+        loop {
+            let (header, response) = self.read_packet()?;
+            match header >> 4 {
+                9 if response.get(..2) == Some(&packet_id.to_be_bytes()) => {
+                    if response.len() != topics.len() + 2
+                        || response[2..].iter().any(|code| !matches!(code, 0 | 1))
+                    {
+                        bail!("AWS IoT rejected MQTT subscription: {:?}", &response[2..]);
+                    }
+                    return Ok(());
+                }
+                3 => self.queue_publish(header, &response)?,
+                13 => {}
+                _ => {}
+            }
         }
-        Ok(())
     }
 
     fn publish_status(&mut self, online: bool) -> anyhow::Result<()> {

@@ -6,13 +6,9 @@ use anyhow::{bail, Context};
 use environmental_core::TelemetryEnvelope;
 
 const SPOOL_PATH: &str = "/sdcard/aws-iot-pending.jsonl";
-const SPOOL_TEMP_PATH: &str = "/sdcard/aws-iot-pending.jsonl.tmp";
 const CURSOR_PATH: &str = "/sdcard/aws-iot-cursor";
-const CURSOR_TEMP_PATH: &str = "/sdcard/aws-iot-cursor.tmp";
 const SEQUENCE_PATH: &str = "/sdcard/aws-iot-sequence";
-const SEQUENCE_TEMP_PATH: &str = "/sdcard/aws-iot-sequence.tmp";
 const MAX_SPOOL_BYTES: u64 = 64 * 1024 * 1024;
-const COMPACT_AFTER_BYTES: u64 = 1024 * 1024;
 
 pub struct PendingRecord {
     pub event_id: String,
@@ -39,11 +35,7 @@ impl AwsSpool {
         let next = current
             .checked_add(1)
             .context("AWS telemetry sequence exhausted")?;
-        write_atomic(
-            SEQUENCE_TEMP_PATH,
-            SEQUENCE_PATH,
-            format!("{next}\n").as_bytes(),
-        )?;
+        append_number(SEQUENCE_PATH, next)?;
         Ok(current)
     }
 
@@ -53,8 +45,7 @@ impl AwsSpool {
             .sd_guard
             .lock()
             .map_err(|_| anyhow::anyhow!("SD mutex poisoned"))?;
-        compact_if_needed()?;
-        repair_torn_tail()?;
+        repair_torn_tail_at(SPOOL_PATH)?;
         let spool_bytes = match fs::metadata(SPOOL_PATH) {
             Ok(metadata) => metadata.len(),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
@@ -95,10 +86,14 @@ impl AwsSpool {
             if !line.ends_with('\n') {
                 break;
             }
-            let (event_id, payload) = line
-                .trim_end_matches('\n')
-                .split_once('\t')
-                .context("invalid AWS spool record")?;
+            let raw = line.trim_end_matches('\n');
+            let (event_id, payload) = match raw.split_once('\t') {
+                Some(parts) => parts,
+                None => (
+                    legacy_event_id(raw).context("invalid AWS spool record")?,
+                    raw,
+                ),
+            };
             if event_id.is_empty() || payload.is_empty() {
                 bail!("invalid AWS spool record");
             }
@@ -124,11 +119,11 @@ impl AwsSpool {
         if !line.ends_with('\n') {
             bail!("application ACK arrived for a torn spool record");
         }
-        let stored_event_id = line
-            .trim_end_matches('\n')
-            .split_once('\t')
-            .map(|(stored_event_id, _)| stored_event_id)
-            .context("invalid AWS spool record")?;
+        let raw = line.trim_end_matches('\n');
+        let stored_event_id = match raw.split_once('\t') {
+            Some((stored_event_id, _)) => stored_event_id,
+            None => legacy_event_id(raw).context("invalid AWS spool record")?,
+        };
         if stored_event_id != event_id {
             bail!("application ACK does not match the oldest durable event");
         }
@@ -155,30 +150,8 @@ fn open_at_cursor() -> anyhow::Result<Option<BufReader<File>>> {
     Ok(Some(reader))
 }
 
-fn compact_if_needed() -> anyhow::Result<()> {
-    let cursor = read_number(CURSOR_PATH)?.unwrap_or(0);
-    if cursor < COMPACT_AFTER_BYTES {
-        return Ok(());
-    }
-    let mut source = match File::open(SPOOL_PATH) {
-        Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return write_cursor(0),
-        Err(error) => return Err(error.into()),
-    };
-    source.seek(SeekFrom::Start(cursor.min(source.metadata()?.len())))?;
-    let mut replacement = File::create(SPOOL_TEMP_PATH)?;
-    std::io::copy(&mut source, &mut replacement)?;
-    replacement.sync_data()?;
-    drop(replacement);
-    // Cursor first is deliberate: interruption can replay acknowledged rows,
-    // which cloud idempotency tolerates, but can never skip pending rows.
-    write_cursor(0)?;
-    fs::rename(SPOOL_TEMP_PATH, SPOOL_PATH)?;
-    Ok(())
-}
-
-fn repair_torn_tail() -> anyhow::Result<()> {
-    let mut file = match OpenOptions::new().read(true).write(true).open(SPOOL_PATH) {
+fn repair_torn_tail_at(path: &str) -> anyhow::Result<()> {
+    let mut file = match OpenOptions::new().read(true).write(true).open(path) {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(error.into()),
@@ -207,31 +180,45 @@ fn repair_torn_tail() -> anyhow::Result<()> {
     Ok(())
 }
 
+fn legacy_event_id(record: &str) -> Option<&str> {
+    let remainder = record.split_once("\"eventId\":\"")?.1;
+    let event_id = remainder.split_once('"')?.0;
+    (!event_id.is_empty()).then_some(event_id)
+}
+
 fn read_number(path: &str) -> anyhow::Result<Option<u64>> {
-    match fs::read_to_string(path) {
-        Ok(raw) => raw
-            .trim()
-            .parse::<u64>()
-            .context("invalid AWS spool metadata")
-            .map(Some),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(error.into()),
+    let file = match File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let mut reader = BufReader::new(file);
+    let mut last = None;
+    loop {
+        let mut line = String::new();
+        if reader.read_line(&mut line)? == 0 {
+            break;
+        }
+        if !line.ends_with('\n') {
+            break;
+        }
+        last = Some(
+            line.trim_end_matches('\n')
+                .parse::<u64>()
+                .context("invalid AWS spool metadata")?,
+        );
     }
+    Ok(last)
 }
 
 fn write_cursor(cursor: u64) -> anyhow::Result<()> {
-    write_atomic(
-        CURSOR_TEMP_PATH,
-        CURSOR_PATH,
-        format!("{cursor}\n").as_bytes(),
-    )
+    append_number(CURSOR_PATH, cursor)
 }
 
-fn write_atomic(temporary: &str, destination: &str, bytes: &[u8]) -> anyhow::Result<()> {
-    let mut file = File::create(temporary)?;
-    file.write_all(bytes)?;
+fn append_number(path: &str, value: u64) -> anyhow::Result<()> {
+    repair_torn_tail_at(path)?;
+    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+    writeln!(file, "{value}")?;
     file.sync_data()?;
-    drop(file);
-    fs::rename(temporary, destination)?;
     Ok(())
 }
