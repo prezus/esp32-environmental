@@ -13,6 +13,7 @@ mod config;
 mod device_bundle {
     include!(concat!(env!("OUT_DIR"), "/device_bundle.rs"));
 }
+mod neopixel;
 mod ota;
 mod rtc;
 mod sensor;
@@ -23,7 +24,7 @@ use std::cell::RefCell;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
-use anyhow::anyhow;
+use anyhow::{anyhow, Context};
 use embedded_hal::i2c::I2c;
 use embedded_hal_bus::i2c::RefCellDevice;
 use environmental_core::{EnvironmentalData, TelemetryEnvelope, TimeQuality};
@@ -66,7 +67,17 @@ fn main() -> anyhow::Result<()> {
     set_timezone("MST7MDT,M3.2.0,M11.1.0");
 
     let peripherals = Peripherals::take()?;
+    let neo_pixel_channel = peripherals.rmt.channel0;
     let pins = peripherals.pins;
+
+    // The Feather's onboard NeoPixel uses GPIO33 and its switched power rail uses GPIO21.
+    let mut neo_pixel_power = PinDriver::output(pins.gpio21)?;
+    neo_pixel_power.set_high()?;
+    let neo_pixel = Arc::new(Mutex::new(
+        ws2812_esp32_rmt_driver::Ws2812Esp32RmtDriver::new(neo_pixel_channel, pins.gpio33)
+            .context("failed to initialize onboard NeoPixel")?,
+    ));
+    neopixel::set_color(&neo_pixel, environmental_core::NeoPixelColor::Off)?;
 
     // ── I2C power rail ──────────────────────────────────────────────────────
     // On the S3 Feather the STEMMA QT / I2C rail is gated by GPIO7 (I2C_POWER);
@@ -186,6 +197,7 @@ fn main() -> anyhow::Result<()> {
             aws_spool.clone(),
             sample_interval_seconds.clone(),
             calibration.clone(),
+            neo_pixel.clone(),
         )?;
         Some((aws_spool, device_id, boot_id, _worker))
     } else {

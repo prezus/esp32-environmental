@@ -6,7 +6,8 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::aws_spool::AwsSpool;
-use crate::{ota, Calibration};
+use crate::neopixel::SharedNeoPixel;
+use crate::{neopixel, ota, Calibration};
 use anyhow::{bail, Context};
 use environmental_core::{
     job_status, parse_application_ack, parse_next_job, parse_shadow_document, reported_shadow,
@@ -113,11 +114,20 @@ pub fn start_delivery_worker(
     spool: AwsSpool,
     sample_interval_seconds: Arc<AtomicU32>,
     calibration: Calibration,
+    neo_pixel: SharedNeoPixel,
 ) -> anyhow::Result<std::thread::JoinHandle<()>> {
     std::thread::Builder::new()
         .name("aws-iot-prototype".into())
         .stack_size(24 * 1024)
-        .spawn(move || delivery_worker(config, spool, sample_interval_seconds, calibration))
+        .spawn(move || {
+            delivery_worker(
+                config,
+                spool,
+                sample_interval_seconds,
+                calibration,
+                neo_pixel,
+            );
+        })
         .context("failed to spawn AWS IoT worker")
 }
 
@@ -126,9 +136,16 @@ fn delivery_worker(
     spool: AwsSpool,
     sample_interval_seconds: Arc<AtomicU32>,
     calibration: Calibration,
+    neo_pixel: SharedNeoPixel,
 ) {
     loop {
-        let result = run_session(&config, &spool, &sample_interval_seconds, &calibration);
+        let result = run_session(
+            &config,
+            &spool,
+            &sample_interval_seconds,
+            &calibration,
+            &neo_pixel,
+        );
         if let Err(error) = result {
             log::warn!("AWS IoT session failed; local SD logging continues: {error:#}");
         }
@@ -141,6 +158,7 @@ fn run_session(
     spool: &AwsSpool,
     sample_interval_seconds: &AtomicU32,
     calibration: &Calibration,
+    neo_pixel: &SharedNeoPixel,
 ) -> anyhow::Result<()> {
     let mut client = MqttClient::connect(config.clone())?;
     client.subscribe()?;
@@ -155,6 +173,7 @@ fn run_session(
             &payload,
             sample_interval_seconds,
             calibration,
+            neo_pixel,
         )?;
         if is_get_response {
             break;
@@ -170,6 +189,7 @@ fn run_session(
             &payload,
             sample_interval_seconds,
             calibration,
+            neo_pixel,
         )?;
         if is_jobs_response {
             break;
@@ -186,6 +206,7 @@ fn run_session(
                 &payload,
                 sample_interval_seconds,
                 calibration,
+                neo_pixel,
             )? {
                 if event_id == record.event_id {
                     spool.acknowledge_head(&event_id)?;
@@ -204,6 +225,7 @@ fn process_control(
     payload: &[u8],
     sample_interval_seconds: &AtomicU32,
     calibration: &Calibration,
+    neo_pixel: &SharedNeoPixel,
 ) -> anyhow::Result<Option<String>> {
     if topic == client.config.acknowledgement_topic() {
         return parse_application_ack(payload)
@@ -269,6 +291,7 @@ fn process_control(
             delta.configuration.sample_interval_seconds as u32,
             Ordering::Release,
         );
+        neopixel::set_color(neo_pixel, delta.configuration.neo_pixel_color)?;
         *calibration
             .lock()
             .map_err(|_| anyhow::anyhow!("calibration mutex poisoned"))? =

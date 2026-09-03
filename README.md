@@ -30,6 +30,7 @@ All values below are confirmed against Adafruit's ESP32-S3 Feather board definit
 | I²C power rail | 7 | `I2C_POWER`; driven high to power the STEMMA QT port |
 | SPI SCK / MOSI / MISO | 36 / 35 / 37 | SD card |
 | SD chip-select | 10 | Adalogger default CS (the `D10` header pin) |
+| Onboard NeoPixel data / power | 33 / 21 | Adafruit Feather board definition; power driven high |
 
 The only hardware-dependent one is the **SD chip-select**: the Adalogger ships with its
 CS trace jumpered to `D10` (= GPIO10), which matches. If SD mounting fails, check that
@@ -165,9 +166,11 @@ runs over TLS TCP 443 with `x-amzn-mqtt-ca`, a retained Last Will, a persistent
 session, and per-device topics. MQTT PUBACK never removes a spool record; only a
 matching accepted/duplicate application ACK after D1 commit removes its head.
 
-Device Shadow desired state controls `sampleIntervalSeconds` (10–3600) and
-`temperatureOffsetF` (-20–20). Values are applied and then reported; unknown or
-partial configuration is rejected. AWS Jobs requests the next execution on
+Device Shadow desired state controls `sampleIntervalSeconds` (10–3600),
+`temperatureOffsetF` (-20–20), and `neoPixelColor` (`off`, `red`, `green`,
+`blue`, `amber`, `purple`, or `white`). The onboard NeoPixel uses GPIO33 with
+its GPIO21 power rail enabled; brightness is capped in firmware. Values are
+applied and then reported, and unknown configuration is rejected. AWS Jobs requests the next execution on
 each session. An applicable `install` document downloads a signed image over
 HTTPS into the inactive OTA slot, publishes execution status, and reboots.
 

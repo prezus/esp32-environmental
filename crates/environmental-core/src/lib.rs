@@ -76,11 +76,25 @@ pub fn parse_application_ack(payload: &[u8]) -> Result<ApplicationAck, String> {
     Ok(ack)
 }
 
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum NeoPixelColor {
+    #[default]
+    Off,
+    Red,
+    Green,
+    Blue,
+    Amber,
+    Purple,
+    White,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct DesiredConfiguration {
     pub sample_interval_seconds: u64,
     pub temperature_offset_f: f32,
+    pub neo_pixel_color: NeoPixelColor,
 }
 
 impl Default for DesiredConfiguration {
@@ -88,6 +102,7 @@ impl Default for DesiredConfiguration {
         Self {
             sample_interval_seconds: 30,
             temperature_offset_f: 0.0,
+            neo_pixel_color: NeoPixelColor::Off,
         }
     }
 }
@@ -130,10 +145,17 @@ pub fn parse_shadow_document(payload: &[u8]) -> Result<Option<ShadowDelta>, Stri
         .and_then(Value::as_f64)
         .filter(|value| (-20.0..=20.0).contains(value))
         .ok_or("invalid temperatureOffsetF")? as f32;
+    let neo_pixel_color = desired
+        .get("neoPixelColor")
+        .map(|value| serde_json::from_value(value.clone()).map_err(|_| "invalid neoPixelColor"))
+        .transpose()?
+        .unwrap_or_default();
     let unsupported_keys = desired
         .keys()
         .filter(|key| {
-            key.as_str() != "sampleIntervalSeconds" && key.as_str() != "temperatureOffsetF"
+            key.as_str() != "sampleIntervalSeconds"
+                && key.as_str() != "temperatureOffsetF"
+                && key.as_str() != "neoPixelColor"
         })
         .cloned()
         .collect();
@@ -142,6 +164,7 @@ pub fn parse_shadow_document(payload: &[u8]) -> Result<Option<ShadowDelta>, Stri
         configuration: DesiredConfiguration {
             sample_interval_seconds,
             temperature_offset_f,
+            neo_pixel_color,
         },
         unsupported_keys,
     }))
@@ -152,7 +175,8 @@ pub fn reported_shadow(configuration: &DesiredConfiguration, desired_version: u6
         "schemaVersion": SHADOW_SCHEMA_VERSION,
         "desiredVersionApplied": desired_version,
         "sampleIntervalSeconds": configuration.sample_interval_seconds,
-        "temperatureOffsetF": configuration.temperature_offset_f
+        "temperatureOffsetF": configuration.temperature_offset_f,
+        "neoPixelColor": configuration.neo_pixel_color
     }}})
 }
 
@@ -269,13 +293,14 @@ mod tests {
     #[test]
     fn shadow_delta_and_get_response_share_one_parser() {
         let delta = parse_shadow_document(
-            br#"{"version":7,"state":{"sampleIntervalSeconds":60,"temperatureOffsetF":-2.5}}"#,
+            br#"{"version":7,"state":{"sampleIntervalSeconds":60,"temperatureOffsetF":-2.5,"neoPixelColor":"purple"}}"#,
         )
         .unwrap()
         .unwrap();
-        let get = parse_shadow_document(br#"{"version":7,"state":{"desired":{"sampleIntervalSeconds":60,"temperatureOffsetF":-2.5}}}"#)
+        let get = parse_shadow_document(br#"{"version":7,"state":{"desired":{"sampleIntervalSeconds":60,"temperatureOffsetF":-2.5,"neoPixelColor":"purple"}}}"#)
             .unwrap().unwrap();
         assert_eq!(delta, get);
+        assert_eq!(delta.configuration.neo_pixel_color, NeoPixelColor::Purple);
         assert_eq!(
             reported_shadow(&delta.configuration, 7)["state"]["reported"]["desiredVersionApplied"],
             7
@@ -308,5 +333,7 @@ mod tests {
         let parsed = parse_shadow_document(br#"{"version":1,"state":{"sampleIntervalSeconds":60,"temperatureOffsetF":0,"heater":true}}"#)
             .unwrap().unwrap();
         assert_eq!(parsed.unsupported_keys, ["heater"]);
+        assert_eq!(parsed.configuration.neo_pixel_color, NeoPixelColor::Off);
+        assert!(parse_shadow_document(br#"{"version":1,"state":{"sampleIntervalSeconds":60,"temperatureOffsetF":0,"neoPixelColor":"orange"}}"#).is_err());
     }
 }
